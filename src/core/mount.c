@@ -220,6 +220,10 @@ static void mount_done(Unit *u) {
 
         m->where = mfree(m->where);
 
+        /* hash ops relies on parameters_proc_self_mountinfo so must be freed before */
+        if (m->mountinfo_key.path)
+                (void) hashmap_remove(u->manager->mountinfo_cache, &m->mountinfo_key);
+
         mount_parameters_done(&m->parameters_proc_self_mountinfo);
         mount_parameters_done(&m->parameters_fragment);
 
@@ -232,9 +236,6 @@ static void mount_done(Unit *u) {
         mount_unwatch_control_pid(m);
 
         m->timer_event_source = sd_event_source_unref(m->timer_event_source);
-
-        if (m->mountinfo_key.path)
-                (void) hashmap_remove(u->manager->mountinfo_cache, &m->mountinfo_key);
 }
 
 static MountParameters* get_mount_parameters_fragment(Mount *m) {
@@ -1804,12 +1805,27 @@ static int mount_load_proc_self_mountinfo(Manager *m, bool set_flags) {
 
                 mu = hashmap_get2(m->mountinfo_cache, &e, (void **)&key);
                 if (mu) {
-                        if (mu->state == MOUNT_MOUNTED) {
-                                mu->proc_flags |= MOUNT_PROC_IS_MOUNTED;
-                                log_debug("Mount entry '%s %s %s %s' already known, won't set device or update mount unit", e.device, e.path, e.options, e.fstype);
-                                continue;
-                        }
+                        _cleanup_free_ char *dev = NULL;
+                        Unit *u;
+
+                        if (mu->state != MOUNT_MOUNTED)
+                                goto new_or_changed;
+
+                        r = unit_name_from_path(e.device, ".device", &dev);
+                        if (r < 0)
+                                goto new_or_changed;
+                        u = manager_get_unit(m, dev);
+                        if (!u)
+                                goto new_or_changed;
+                        if (DEVICE(u)->state != DEVICE_PLUGGED)
+                                goto new_or_changed;
+
+                        mu->proc_flags |= MOUNT_PROC_IS_MOUNTED;
+                        log_debug("Mount entry '%s %s %s %s' already known, won't set device or update mount unit", e.device, e.path, e.options, e.fstype);
+                        continue;
                 }
+
+new_or_changed:
 
                 log_debug("Setting up mount entry '%s %s %s %s'", e.device, e.path, e.options, e.fstype);
 
